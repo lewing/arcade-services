@@ -13,6 +13,7 @@ public class CachedInteractiveBrowserCredential: TokenCredential
 
     private readonly InteractiveBrowserCredentialOptions _options;
     private readonly string _authRecordPath;
+    private readonly object _lock = new();
 
     private int _isCached = 0;
     private int _isDeviceCodeFallback = 0;
@@ -52,19 +53,22 @@ public class CachedInteractiveBrowserCredential: TokenCredential
     {
         CacheAuthenticationRecord(requestContext, cancellationToken);
 
+        // Capture credentials locally so we use a consistent pair
+        var (browser, deviceCode) = GetCredentials();
+
         if (Volatile.Read(ref _isDeviceCodeFallback) == 1)
         {
-            return _deviceCodeCredential.GetToken(requestContext, cancellationToken);
+            return deviceCode.GetToken(requestContext, cancellationToken);
         }
 
         try
         {
-            return _browserCredential.GetToken(requestContext, cancellationToken);
+            return browser.GetToken(requestContext, cancellationToken);
         }
         catch (AuthenticationFailedException)
         {
             Interlocked.Exchange(ref _isDeviceCodeFallback, 1);
-            return _deviceCodeCredential.GetToken(requestContext, cancellationToken);
+            return deviceCode.GetToken(requestContext, cancellationToken);
         }
     }
 
@@ -72,19 +76,29 @@ public class CachedInteractiveBrowserCredential: TokenCredential
     {
         CacheAuthenticationRecord(requestContext, cancellationToken);
 
+        var (browser, deviceCode) = GetCredentials();
+
         if (Volatile.Read(ref _isDeviceCodeFallback) == 1)
         {
-            return await _deviceCodeCredential.GetTokenAsync(requestContext, cancellationToken);
+            return await deviceCode.GetTokenAsync(requestContext, cancellationToken);
         }
 
         try
         {
-            return await _browserCredential.GetTokenAsync(requestContext, cancellationToken);
+            return await browser.GetTokenAsync(requestContext, cancellationToken);
         }
         catch (AuthenticationFailedException)
         {
             Interlocked.Exchange(ref _isDeviceCodeFallback, 1);
-            return await _deviceCodeCredential.GetTokenAsync(requestContext, cancellationToken);
+            return await deviceCode.GetTokenAsync(requestContext, cancellationToken);
+        }
+    }
+
+    private (InteractiveBrowserCredential browser, DeviceCodeCredential deviceCode) GetCredentials()
+    {
+        lock (_lock)
+        {
+            return (_browserCredential, _deviceCodeCredential);
         }
     }
 
@@ -101,43 +115,40 @@ public class CachedInteractiveBrowserCredential: TokenCredential
             return;
         }
 
-        var authRecordDir = Path.GetDirectoryName(_authRecordPath) ??
-            throw new ArgumentException($"Cannot resolve cache dir from auth record: {_authRecordPath}");
-
-        if (!Directory.Exists(authRecordDir))
+        lock (_lock)
         {
-            Directory.CreateDirectory(authRecordDir);
-        }
-
-        static bool IsMsalCachePersistenceException(Exception e) =>
-            e is MsalCachePersistenceException || (e.InnerException is not null && IsMsalCachePersistenceException(e.InnerException));
-
-        AuthenticationRecord authRecord;
-        try
-        {
-            // Prompt the user for consent and save the resulting authentication record on disk
-            authRecord = Authenticate(requestContext, cancellationToken);
-        }
-        catch (Exception e) when (IsMsalCachePersistenceException(e))
-        {
-            // If we cannot persist the token cache, fall back to interactive authentication without persistence
-            _browserCredential = new InteractiveBrowserCredential(new InteractiveBrowserCredentialOptions()
+            // Double-check after acquiring lock
+            if (Volatile.Read(ref _isCached) == 1)
             {
-                TenantId = _options.TenantId,
-                ClientId = _options.ClientId,
-            });
-            _deviceCodeCredential = new DeviceCodeCredential(new()
+                return;
+            }
+
+            var authRecordDir = Path.GetDirectoryName(_authRecordPath) ??
+                throw new ArgumentException($"Cannot resolve cache dir from auth record: {_authRecordPath}");
+
+            if (!Directory.Exists(authRecordDir))
             {
-                TenantId = _options.TenantId,
-                ClientId = _options.ClientId,
-            });
-            authRecord = Authenticate(requestContext, cancellationToken);
+                Directory.CreateDirectory(authRecordDir);
+            }
+
+            AuthenticationRecord authRecord;
+            try
+            {
+                // Prompt the user for consent and save the resulting authentication record on disk
+                authRecord = Authenticate(requestContext, cancellationToken);
+            }
+            catch (Exception e) when (IsMsalCachePersistenceException(e))
+            {
+                // If we cannot persist the token cache, fall back to interactive authentication without persistence
+                RecreateCredentialsWithoutPersistence();
+                authRecord = Authenticate(requestContext, cancellationToken);
+            }
+
+            using var authRecordStream = new FileStream(_authRecordPath, FileMode.Create, FileAccess.Write);
+            authRecord.Serialize(authRecordStream, cancellationToken);
+
+            Interlocked.Exchange(ref _isCached, 1);
         }
-
-        using var authRecordStream = new FileStream(_authRecordPath, FileMode.Create, FileAccess.Write);
-        authRecord.Serialize(authRecordStream, cancellationToken);
-
-        Interlocked.Exchange(ref _isCached, 1);
     }
 
     private AuthenticationRecord Authenticate(TokenRequestContext requestContext, CancellationToken cancellationToken)
@@ -153,4 +164,22 @@ public class CachedInteractiveBrowserCredential: TokenCredential
             return _deviceCodeCredential.Authenticate(requestContext, cancellationToken);
         }
     }
+
+    private void RecreateCredentialsWithoutPersistence()
+    {
+        // Caller must hold _lock
+        _browserCredential = new InteractiveBrowserCredential(new InteractiveBrowserCredentialOptions()
+        {
+            TenantId = _options.TenantId,
+            ClientId = _options.ClientId,
+        });
+        _deviceCodeCredential = new DeviceCodeCredential(new()
+        {
+            TenantId = _options.TenantId,
+            ClientId = _options.ClientId,
+        });
+    }
+
+    private static bool IsMsalCachePersistenceException(Exception e) =>
+        e is MsalCachePersistenceException || (e.InnerException is not null && IsMsalCachePersistenceException(e.InnerException));
 }
